@@ -8,11 +8,14 @@ Reads directly from the SQLite databases in the app's sandbox container.
 
 import json
 import sqlite3
+import urllib.request
+import urllib.error
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+import feedparser
 from mcp.server.fastmcp import FastMCP
 
 # ── Database location ────────────────────────────────────────────────────────
@@ -113,6 +116,37 @@ def _row_to_article(row: sqlite3.Row, account_name: str) -> dict:
         "dateArrived": row["dateArrived"],
         "read": bool(row["read"]),
         "starred": bool(row["starred"]),
+    }
+
+
+# ── Feed URL helpers ─────────────────────────────────────────────────────────
+
+def _normalize_feed_url(feed_id: str) -> str:
+    """
+    Return the plain RSS URL from a feedID, regardless of account type.
+
+    Feedly stores feedIDs as  'feed/https://example.com/rss'
+    On My Mac stores them as  'https://example.com/rss'
+    """
+    if feed_id.startswith("feed/"):
+        return feed_id[len("feed/"):]
+    return feed_id
+
+
+def _feedparser_entry_to_dict(entry: dict) -> dict:
+    """Normalise a feedparser entry into a consistent dict."""
+    published_ts: Optional[float] = None
+    if entry.get("published_parsed"):
+        published_ts = datetime(*entry["published_parsed"][:6]).timestamp()
+    elif entry.get("updated_parsed"):
+        published_ts = datetime(*entry["updated_parsed"][:6]).timestamp()
+
+    return {
+        "title": entry.get("title"),
+        "url": entry.get("link"),
+        "summary": entry.get("summary"),
+        "datePublished": published_ts,
+        "authors": [a.get("name") for a in entry.get("authors", []) if a.get("name")],
     }
 
 
@@ -295,14 +329,22 @@ def get_articles_by_feed(
     unread_only: bool = False,
 ) -> str:
     """
-    Get recent articles from a specific RSS feed.
+    Get recent articles from a specific RSS feed stored in NetNewsWire.
+
+    Accepts both plain RSS URLs and Feedly-style 'feed/https://...' IDs.
+    Results are limited to what NetNewsWire has retained locally (~30-90 days).
+    Use fetch_feed_live or fetch_feed_history to go further back.
 
     Args:
-        feed_url:    The feed's RSS URL (feed_url from list_feeds).
+        feed_url:    The feed's RSS URL (feed_url from list_feeds), or a
+                     Feedly feedID like 'feed/https://example.com/rss'.
         limit:       Max articles to return (default 20, max 100).
         unread_only: If true, return only unread articles.
     """
     limit = min(max(1, limit), 100)
+    # Build both candidate feedIDs so the query works regardless of account type
+    raw_url = _normalize_feed_url(feed_url)
+    feedly_id = f"feed/{raw_url}"
     accounts = _discover_accounts()
     articles: list[dict] = []
 
@@ -314,9 +356,9 @@ def get_articles_by_feed(
                        a.datePublished, s.dateArrived, s.read, s.starred
                 FROM   articles a
                 JOIN   statuses s ON a.articleID = s.articleID
-                WHERE  a.feedID = ?
+                WHERE  a.feedID IN (?, ?)
             """
-            params: list = [feed_url]
+            params: list = [raw_url, feedly_id]
             if unread_only:
                 sql += " AND s.read = 0"
             sql += " ORDER BY a.datePublished DESC LIMIT ?"
@@ -442,6 +484,118 @@ def get_article_content(article_id: str) -> str:
             return json.dumps({"error": str(exc)})
 
     return json.dumps({"error": f"Article '{article_id}' not found in any account."})
+
+
+# ── Live / historical feed fetching ──────────────────────────────────────────
+
+@mcp.tool()
+def fetch_feed_live(feed_url: str, limit: int = 50) -> str:
+    """
+    Fetch articles directly from an RSS/Atom feed URL right now, bypassing
+    NetNewsWire's local cache.  Returns whatever the feed currently publishes
+    (typically the last 20-100 items depending on the feed).
+
+    Use this when get_articles_by_feed returns nothing or you need fresher /
+    slightly older items than what NetNewsWire has retained.
+
+    Accepts both plain RSS URLs and Feedly-style 'feed/https://...' IDs.
+
+    Args:
+        feed_url: The RSS/Atom feed URL.
+        limit:    Max articles to return (default 50).
+    """
+    limit = min(max(1, limit), 200)
+    url = _normalize_feed_url(feed_url)
+
+    feed = feedparser.parse(url)
+    if feed.bozo and not feed.entries:
+        return json.dumps({"error": f"Failed to parse feed: {feed.bozo_exception}"})
+
+    articles = [_feedparser_entry_to_dict(e) for e in feed.entries[:limit]]
+    return json.dumps(
+        {
+            "feed_title": feed.feed.get("title"),
+            "feed_url": url,
+            "fetched_at": datetime.now().isoformat(),
+            "count": len(articles),
+            "articles": articles,
+        },
+        indent=2,
+    )
+
+
+@mcp.tool()
+def fetch_feed_history(
+    feed_url: str,
+    date: str,
+    limit: int = 20,
+) -> str:
+    """
+    Fetch an archived snapshot of a feed from the Wayback Machine (Internet
+    Archive), letting you read articles published months or years ago.
+
+    Steps: finds the closest archived copy of the RSS feed on or after the
+    given date, then parses it to return the articles it contained at that time.
+
+    Args:
+        feed_url: The RSS/Atom feed URL (plain URL or Feedly 'feed/...' ID).
+        date:     The target date as YYYY-MM-DD (e.g. '2024-06-01').
+                  The nearest available snapshot on or after this date is used.
+        limit:    Max articles to return from that snapshot (default 20).
+    """
+    limit = min(max(1, limit), 100)
+    url = _normalize_feed_url(feed_url)
+
+    # ── 1. Ask CDX API for the closest snapshot ───────────────────────────────
+    date_compact = date.replace("-", "")  # YYYYMMDD → 20240601
+    cdx_url = (
+        "https://web.archive.org/cdx/search/cdx"
+        f"?url={urllib.request.quote(url, safe='')}"
+        f"&output=json&limit=1&fl=timestamp,statuscode"
+        f"&from={date_compact}&filter=statuscode:200"
+    )
+    try:
+        req = urllib.request.Request(
+            cdx_url,
+            headers={"User-Agent": "nnw-mcp/1.0 (NetNewsWire MCP history tool)"},
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            cdx_data = json.loads(resp.read())
+    except urllib.error.URLError as exc:
+        return json.dumps({"error": f"Wayback Machine CDX lookup failed: {exc}"})
+
+    # cdx_data is [["timestamp","statuscode"], [value, value], ...]
+    rows = [r for r in cdx_data if r[0] != "timestamp"]  # drop header row
+    if not rows:
+        return json.dumps({
+            "error": f"No Wayback Machine snapshot found for '{url}' on or after {date}."
+        })
+
+    snapshot_ts = rows[0][0]  # e.g. "20240601123456"
+    snapshot_url = f"https://web.archive.org/web/{snapshot_ts}id_/{url}"
+    snapshot_date = f"{snapshot_ts[:4]}-{snapshot_ts[4:6]}-{snapshot_ts[6:8]}"
+
+    # ── 2. Fetch and parse the archived feed ──────────────────────────────────
+    feed = feedparser.parse(snapshot_url)
+    if feed.bozo and not feed.entries:
+        return json.dumps({
+            "error": f"Failed to parse archived feed snapshot: {feed.bozo_exception}",
+            "snapshot_url": snapshot_url,
+        })
+
+    articles = [_feedparser_entry_to_dict(e) for e in feed.entries[:limit]]
+    return json.dumps(
+        {
+            "feed_title": feed.feed.get("title"),
+            "feed_url": url,
+            "requested_date": date,
+            "snapshot_date": snapshot_date,
+            "snapshot_url": snapshot_url,
+            "count": len(articles),
+            "articles": articles,
+        },
+        indent=2,
+    )
 
 
 # ── Entry point ──────────────────────────────────────────────────────────────
